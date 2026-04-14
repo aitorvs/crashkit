@@ -1,0 +1,74 @@
+apply plugin: 'com.android.application'
+apply plugin: 'kotlin-android'
+
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) localProps.load(localPropsFile.newDataInputStream())
+def crashpadHost = localProps.getProperty('crashpad.uploadHost', '10.0.2.2')
+
+android {
+    compileSdkVersion 34
+
+    defaultConfig {
+        applicationId "com.duckduckgo.crashkit.sample"
+        minSdkVersion 23
+        targetSdkVersion 33
+        versionCode 1
+        versionName "1.0"
+
+        ndkVersion "28.2.13676358"
+        ndk {
+            abiFilters "arm64-v8a", "x86_64"
+        }
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        debug {
+            zipAlignEnabled true
+            // 10.0.2.2 is the Android emulator's alias for the host machine.
+            // Replace with your Mac's local IP when running on a real device.
+            buildConfigField "String", "CRASHPAD_UPLOAD_URL", "\"http://${crashpadHost}:8080/upload\""
+            buildConfigField "boolean", "CRASHPAD_UPLOADS_ENABLED", "true"
+        }
+        release {
+            minifyEnabled false
+            zipAlignEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            buildConfigField "String", "CRASHPAD_UPLOAD_URL", '""'
+            buildConfigField "boolean", "CRASHPAD_UPLOADS_ENABLED", "false"
+        }
+    }
+
+    buildFeatures {
+        viewBinding true
+        buildConfig true
+    }
+
+    packagingOptions {
+        jniLibs {
+            // keep symbols if you want readable native stacks from the app's .so’s
+            keepDebugSymbols += ['**/arm64-v8a/*.so']
+            // Required: crashpad_handler.so is an executable that Crashpad launches as a
+            // subprocess via exec(). It must exist as a real file on disk. Without this,
+            // AGP stores .so files uncompressed inside the APK (not extracted), so the
+            // handler path would not resolve and StartHandler() would fail silently.
+            useLegacyPackaging = true
+        }
+    }
+
+    namespace 'com.duckduckgo.crashkit.sample'
+}
+
+dependencies {
+    implementation fileTree(dir: "libs", include: ["*.jar"])
+    implementation project(':crashkit')
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.core:core-ktx:1.9.0'
+    implementation 'androidx.appcompat:appcompat:1.5.1'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.4'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.0'
+
+}

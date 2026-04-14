@@ -1,0 +1,4 @@
+commit: 631b657792edbfbbef411956f503311fa395e9a1
+date:   2026-04-08
+title:  ios: Fallback to EXCEPTION_STATE_IDENTITY pre-iOS18.
+url:    https://chromium.googlesource.com/crashpad/crashpad/+/631b657792edbfbbef411956f503311fa395e9a1
