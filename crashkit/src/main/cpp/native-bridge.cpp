@@ -6,6 +6,7 @@
 #include "client/settings.h"
 #include "client/annotation.h"
 #include "client/crashpad_info.h"
+#include "client/simple_string_dictionary.h"
 #include "util/misc/capture_context.h"   // CaptureContext
 #include "util/misc/uuid.h"
 #include <dlfcn.h>
@@ -23,6 +24,7 @@
 #include <memory>
 static std::unique_ptr<crashpad::CrashpadClient> g_client;
 static std::unique_ptr<std::vector<std::string>> g_env;
+static crashpad::SimpleStringDictionary* g_dynamic_annotations = nullptr;
 void stackFrame1();
 void stackFrame2();
 void stackFrame3();
@@ -63,6 +65,7 @@ Java_com_duckduckgo_android_1crashkit_Crashpad_initializeCrashpad(
         jboolean jNoRateLimit,
         jobjectArray jAnnotationKeys,
         jobjectArray jAnnotationValues,
+        jobjectArray jDynamicAnnotationKeys,
         jstring jMarkerPath
 ) {
     // Convert Java strings to C++ with fallback "unknown"
@@ -131,6 +134,16 @@ Java_com_duckduckgo_android_1crashkit_Crashpad_initializeCrashpad(
     for (const auto& key : {"ptype", "osarch"}) {
         arguments.push_back("--allow-annotation=" + string(key));
     }
+    // Dynamic annotation keys — set at runtime via setAnnotation(). Added to the allowlist
+    // so they survive the minidump write filter, but not to the annotations map (no initial value).
+    jsize dynamicKeyCount = env->GetArrayLength(jDynamicAnnotationKeys);
+    for (jsize i = 0; i < dynamicKeyCount; i++) {
+        auto jKey = (jstring) env->GetObjectArrayElement(jDynamicAnnotationKeys, i);
+        const char* key = env->GetStringUTFChars(jKey, nullptr);
+        if (key) arguments.push_back("--allow-annotation=" + string(key));
+        env->ReleaseStringUTFChars(jKey, key);
+        env->DeleteLocalRef(jKey);
+    }
 
     // Crashpad local database
     unique_ptr<CrashReportDatabase> crashReportDatabase = CrashReportDatabase::Initialize(reportsDir);
@@ -166,12 +179,16 @@ Java_com_duckduckgo_android_1crashkit_Crashpad_initializeCrashpad(
     }
     g_client.reset(client);
 
-    // Minimize captured memory to reduce risk of PII: disable indirectly referenced memory
+    // Minimize captured memory to reduce risk of PII: disable indirectly referenced memory.
+    // Also register the dynamic annotation dictionary so setAnnotation() updates are captured
+    // at crash time by reading this process's memory.
     if (auto* info = crashpad::CrashpadInfo::GetCrashpadInfo()) {
         info->set_gather_indirectly_referenced_memory(
                 crashpad::TriState::kDisabled,
                 /*limit=*/0
         );
+        g_dynamic_annotations = new crashpad::SimpleStringDictionary();
+        info->set_simple_annotations(g_dynamic_annotations);
     }
 
     // Register crash marker — written by FirstChanceHandler on crash,
@@ -208,6 +225,23 @@ Java_com_duckduckgo_android_1crashkit_Crashpad_nativeDumpWithoutCrash(
     // Force a dump without crashing
     crashpad::CrashpadClient::DumpWithoutCrash(&ctx);
     return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_duckduckgo_android_1crashkit_Crashpad_nativeSetAnnotation(
+        JNIEnv* env,
+        jobject /* this */,
+        jstring jKey,
+        jstring jValue
+) {
+    if (!g_dynamic_annotations) return;
+    const char* key = env->GetStringUTFChars(jKey, nullptr);
+    const char* val = env->GetStringUTFChars(jValue, nullptr);
+    if (key && val) {
+        g_dynamic_annotations->SetKeyValue(key, val);
+    }
+    env->ReleaseStringUTFChars(jKey, key);
+    env->ReleaseStringUTFChars(jValue, val);
 }
 
 void stackFrame1() {

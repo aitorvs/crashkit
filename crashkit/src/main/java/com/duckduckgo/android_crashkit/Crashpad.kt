@@ -35,6 +35,7 @@ object Crashpad {
         version: String,
         osVersion: String,
         extraAnnotations: Map<String, String> = emptyMap(),
+        dynamicAnnotationKeys: Set<String> = emptySet(),
         config: CrashpadConfig = CrashpadConfig(),
     ): Boolean {
         if (!libraryLoaded) return false
@@ -64,6 +65,7 @@ object Crashpad {
                 noRateLimit = config.noRateLimit,
                 annotationKeys = extraAnnotations.keys.toTypedArray(),
                 annotationValues = extraAnnotations.values.toTypedArray(),
+                dynamicAnnotationKeys = dynamicAnnotationKeys.toTypedArray(),
                 markerPath = markerPath,
             )
         }.getOrDefault(false)
@@ -82,8 +84,22 @@ object Crashpad {
         noRateLimit: Boolean,
         annotationKeys: Array<String>,
         annotationValues: Array<String>,
+        dynamicAnnotationKeys: Array<String>,
         markerPath: String,
     ): Boolean
+
+    /**
+     * Update a named annotation in the crash report. Call this as state changes — the value
+     * captured at crash time will be whatever was set most recently.
+     *
+     * Keys and values are limited to 255 bytes each (Crashpad SimpleStringDictionary limit).
+     * Values exceeding this will be silently truncated by the native layer.
+     * Has no effect before [init] is called.
+     */
+    @JvmStatic fun setAnnotation(key: String, value: String) {
+        if (!inited) return
+        nativeSetAnnotation(key, value)
+    }
 
     @JvmStatic fun crash(): Boolean {
         if (!libraryLoaded) return false
@@ -97,4 +113,5 @@ object Crashpad {
 
     private external fun nativeCrash(): Boolean
     private external fun nativeDumpWithoutCrash(): Boolean
+    private external fun nativeSetAnnotation(key: String, value: String)
 }
