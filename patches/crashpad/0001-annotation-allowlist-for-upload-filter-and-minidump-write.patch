@@ -1,0 +1,821 @@
+diff --git a/handler/crash_report_upload_thread.cc b/handler/crash_report_upload_thread.cc
+index bec87142..67467da2 100644
+--- a/handler/crash_report_upload_thread.cc
++++ b/handler/crash_report_upload_thread.cc
+@@ -312,7 +312,8 @@ CrashReportUploadThread::UploadResult CrashReportUploadThread::UploadReport(
+     if (kv.first == kMinidumpKey) {
+       LOG(WARNING) << "reserved key " << kv.first << ", discarding value "
+                    << kv.second;
+-    } else {
++    } else if (options_.allowed_annotations.empty() ||
++               options_.allowed_annotations.count(kv.first) > 0) {
+       http_multipart_builder.SetFormData(kv.first, kv.second);
+     }
+   }
+diff --git a/handler/crash_report_upload_thread.h b/handler/crash_report_upload_thread.h
+index 22bb26e3..b5320edc 100644
+--- a/handler/crash_report_upload_thread.h
++++ b/handler/crash_report_upload_thread.h
+@@ -17,6 +17,7 @@
+ 
+ #include <functional>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <unordered_map>
+ 
+@@ -62,6 +63,12 @@ class CrashReportUploadThread : public WorkerThread::Delegate,
+     //! reports known to exist by having been added by the ReportPending()
+     //! method. No scans for new pending reports will be conducted.
+     bool watch_pending_reports;
++
++    //! When non-empty, only annotation keys present in this set are included in
++    //! the HTTP upload form fields. Annotations not in the set are dropped
++    //! before upload but remain in the on-disk minidump. When empty, all
++    //! annotations are uploaded (default behaviour, backward compatible).
++    std::set<std::string> allowed_annotations;
+   };
+ 
+   //! \brief Observation callback invoked each time the in-process handler
+diff --git a/handler/handler_main.cc b/handler/handler_main.cc
+index 7a060799..0be57450 100644
+--- a/handler/handler_main.cc
++++ b/handler/handler_main.cc
+@@ -24,6 +24,7 @@
+ #include <atomic>
+ #include <map>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -105,6 +106,9 @@ void Usage(const base::FilePath& me) {
+ "Crashpad's exception handler server.\n"
+ "\n"
+ "      --annotation=KEY=VALUE  set a process annotation in each crash report\n"
++"      --allow-annotation=KEY  allow annotation KEY in HTTP upload form fields;\n"
++"                              when any --allow-annotation is set, only listed\n"
++"                              keys are uploaded (others remain in the minidump)\n"
+   // clang-format on
+ #if defined(ATTACHMENTS_SUPPORTED)
+       // clang-format off
+@@ -220,6 +224,7 @@ void Usage(const base::FilePath& me) {
+ 
+ struct Options {
+   std::map<std::string, std::string> annotations;
++  std::set<std::string> allowed_annotations;
+   std::map<std::string, std::string> monitor_self_annotations;
+   std::string url;
+   base::FilePath database;
+@@ -580,6 +585,7 @@ int HandlerMain(int argc,
+     // Long options without short equivalents.
+     kOptionLastChar = 255,
+     kOptionAnnotation,
++    kOptionAllowAnnotation,
+ #if defined(ATTACHMENTS_SUPPORTED)
+     kOptionAttachment,
+ #endif  // defined(ATTACHMENTS_SUPPORTED)
+@@ -636,6 +642,7 @@ int HandlerMain(int argc,
+ 
+   static constexpr option long_options[] = {
+     {"annotation", required_argument, nullptr, kOptionAnnotation},
++    {"allow-annotation", required_argument, nullptr, kOptionAllowAnnotation},
+ #if defined(ATTACHMENTS_SUPPORTED)
+     {"attachment", required_argument, nullptr, kOptionAttachment},
+ #endif  // ATTACHMENTS_SUPPORTED
+@@ -819,6 +826,10 @@ int HandlerMain(int argc,
+         options.identify_client_via_url = false;
+         break;
+       }
++      case kOptionAllowAnnotation: {
++        options.allowed_annotations.insert(optarg);
++        break;
++      }
+       case kOptionNoPeriodicTasks: {
+         options.periodic_tasks = false;
+         break;
+@@ -1025,6 +1036,7 @@ int HandlerMain(int argc,
+     upload_thread_options.rate_limit = options.rate_limit;
+     upload_thread_options.upload_gzip = options.upload_gzip;
+     upload_thread_options.watch_pending_reports = options.periodic_tasks;
++    upload_thread_options.allowed_annotations = options.allowed_annotations;
+ 
+     upload_thread.Reset(new CrashReportUploadThread(
+         database.get(),
+@@ -1064,7 +1076,8 @@ int HandlerMain(int argc,
+         &options.attachments,
+         true,
+         false,
+-        user_stream_sources);
++        user_stream_sources,
++        &options.allowed_annotations);
+   }
+ #else
+   exception_handler = std::make_unique<CrashReportExceptionHandler>(
+@@ -1082,7 +1095,8 @@ int HandlerMain(int argc,
+       true,
+       false,
+ #endif  // BUILDFLAG(IS_LINUX)
+-      user_stream_sources);
++      user_stream_sources,
++      &options.allowed_annotations);
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+diff --git a/handler/linux/crash_report_exception_handler.cc b/handler/linux/crash_report_exception_handler.cc
+index fff35786..f8de3c4e 100644
+--- a/handler/linux/crash_report_exception_handler.cc
++++ b/handler/linux/crash_report_exception_handler.cc
+@@ -106,14 +106,16 @@ CrashReportExceptionHandler::CrashReportExceptionHandler(
+     const std::vector<base::FilePath>* attachments,
+     bool write_minidump_to_database,
+     bool write_minidump_to_log,
+-    const UserStreamDataSources* user_stream_data_sources)
++    const UserStreamDataSources* user_stream_data_sources,
++    const std::set<std::string>* allowed_annotations)
+     : database_(database),
+       upload_thread_(upload_thread),
+       process_annotations_(process_annotations),
+       attachments_(attachments),
+       write_minidump_to_database_(write_minidump_to_database),
+       write_minidump_to_log_(write_minidump_to_log),
+-      user_stream_data_sources_(user_stream_data_sources) {
++      user_stream_data_sources_(user_stream_data_sources),
++      allowed_annotations_(allowed_annotations) {
+   DCHECK(write_minidump_to_database_ | write_minidump_to_log_);
+ }
+ 
+@@ -219,7 +221,7 @@ bool CrashReportExceptionHandler::WriteMinidumpToDatabase(
+                          : implicit_cast<ProcessSnapshot*>(process_snapshot);
+ 
+   MinidumpFileWriter minidump;
+-  minidump.InitializeFromSnapshot(snapshot);
++  minidump.InitializeFromSnapshot(snapshot, allowed_annotations_);
+   AddUserExtensionStreams(user_stream_data_sources_, snapshot, &minidump);
+ 
+   if (!minidump.WriteEverything(new_report->Writer())) {
+@@ -288,7 +290,7 @@ bool CrashReportExceptionHandler::WriteMinidumpToLog(
+       sanitized_snapshot ? implicit_cast<ProcessSnapshot*>(sanitized_snapshot)
+                          : implicit_cast<ProcessSnapshot*>(process_snapshot);
+   MinidumpFileWriter minidump;
+-  minidump.InitializeFromSnapshot(snapshot);
++  minidump.InitializeFromSnapshot(snapshot, allowed_annotations_);
+   AddUserExtensionStreams(user_stream_data_sources_, snapshot, &minidump);
+ 
+   OutputStreamFileWriter writer(std::make_unique<ZlibOutputStream>(
+diff --git a/handler/linux/crash_report_exception_handler.h b/handler/linux/crash_report_exception_handler.h
+index 9dd15337..e59175d5 100644
+--- a/handler/linux/crash_report_exception_handler.h
++++ b/handler/linux/crash_report_exception_handler.h
+@@ -16,6 +16,7 @@
+ #define CRASHPAD_HANDLER_LINUX_CRASH_REPORT_EXCEPTION_HANDLER_H_
+ 
+ #include <map>
++#include <set>
+ #include <string>
+ 
+ #include "client/crash_report_database.h"
+@@ -69,7 +70,8 @@ class CrashReportExceptionHandler : public ExceptionHandlerServer::Delegate {
+       const std::vector<base::FilePath>* attachments,
+       bool write_minidump_to_database,
+       bool write_minidump_to_log,
+-      const UserStreamDataSources* user_stream_data_sources);
++      const UserStreamDataSources* user_stream_data_sources,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   CrashReportExceptionHandler(const CrashReportExceptionHandler&) = delete;
+   CrashReportExceptionHandler& operator=(const CrashReportExceptionHandler&) =
+@@ -116,6 +118,7 @@ class CrashReportExceptionHandler : public ExceptionHandlerServer::Delegate {
+   bool write_minidump_to_database_;
+   bool write_minidump_to_log_;
+   const UserStreamDataSources* user_stream_data_sources_;  // weak
++  const std::set<std::string>* allowed_annotations_;  // weak
+ };
+ 
+ }  // namespace crashpad
+diff --git a/handler/mac/crash_report_exception_handler.cc b/handler/mac/crash_report_exception_handler.cc
+index 280f5ba9..55a67fa7 100644
+--- a/handler/mac/crash_report_exception_handler.cc
++++ b/handler/mac/crash_report_exception_handler.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "handler/mac/crash_report_exception_handler.h"
+ 
++#include <set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -52,12 +53,14 @@ CrashReportExceptionHandler::CrashReportExceptionHandler(
+     CrashReportUploadThread* upload_thread,
+     const std::map<std::string, std::string>* process_annotations,
+     const std::vector<base::FilePath>* attachments,
+-    const UserStreamDataSources* user_stream_data_sources)
++    const UserStreamDataSources* user_stream_data_sources,
++    const std::set<std::string>* allowed_annotations)
+     : database_(database),
+       upload_thread_(upload_thread),
+       process_annotations_(process_annotations),
+       attachments_(attachments),
+-      user_stream_data_sources_(user_stream_data_sources) {}
++      user_stream_data_sources_(user_stream_data_sources),
++      allowed_annotations_(allowed_annotations) {}
+ 
+ CrashReportExceptionHandler::~CrashReportExceptionHandler() {
+ }
+@@ -171,7 +174,7 @@ kern_return_t CrashReportExceptionHandler::CatchMachException(
+     process_snapshot.SetReportID(new_report->ReportID());
+ 
+     MinidumpFileWriter minidump;
+-    minidump.InitializeFromSnapshot(&process_snapshot);
++    minidump.InitializeFromSnapshot(&process_snapshot, allowed_annotations_);
+     AddUserExtensionStreams(
+         user_stream_data_sources_, &process_snapshot, &minidump);
+ 
+diff --git a/handler/mac/crash_report_exception_handler.h b/handler/mac/crash_report_exception_handler.h
+index 934cbb1b..4e9f8ef0 100644
+--- a/handler/mac/crash_report_exception_handler.h
++++ b/handler/mac/crash_report_exception_handler.h
+@@ -18,6 +18,7 @@
+ #include <mach/mach.h>
+ 
+ #include <map>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -59,7 +60,8 @@ class CrashReportExceptionHandler final
+       CrashReportUploadThread* upload_thread,
+       const std::map<std::string, std::string>* process_annotations,
+       const std::vector<base::FilePath>* attachments,
+-      const UserStreamDataSources* user_stream_data_sources);
++      const UserStreamDataSources* user_stream_data_sources,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   CrashReportExceptionHandler(const CrashReportExceptionHandler&) = delete;
+   CrashReportExceptionHandler& operator=(const CrashReportExceptionHandler&) =
+@@ -93,6 +95,7 @@ class CrashReportExceptionHandler final
+   const std::map<std::string, std::string>* process_annotations_;  // weak
+   const std::vector<base::FilePath>* attachments_;  // weak
+   const UserStreamDataSources* user_stream_data_sources_;  // weak
++  const std::set<std::string>* allowed_annotations_;  // weak
+ };
+ 
+ }  // namespace crashpad
+diff --git a/handler/win/crash_report_exception_handler.cc b/handler/win/crash_report_exception_handler.cc
+index 84979f10..cf0ece26 100644
+--- a/handler/win/crash_report_exception_handler.cc
++++ b/handler/win/crash_report_exception_handler.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "handler/win/crash_report_exception_handler.h"
+ 
++#include <set>
+ #include <type_traits>
+ #include <utility>
+ 
+@@ -38,12 +39,14 @@ CrashReportExceptionHandler::CrashReportExceptionHandler(
+     CrashReportUploadThread* upload_thread,
+     const std::map<std::string, std::string>* process_annotations,
+     const std::vector<base::FilePath>* attachments,
+-    const UserStreamDataSources* user_stream_data_sources)
++    const UserStreamDataSources* user_stream_data_sources,
++    const std::set<std::string>* allowed_annotations)
+     : database_(database),
+       upload_thread_(upload_thread),
+       process_annotations_(process_annotations),
+       attachments_(attachments),
+-      user_stream_data_sources_(user_stream_data_sources) {}
++      user_stream_data_sources_(user_stream_data_sources),
++      allowed_annotations_(allowed_annotations) {}
+ 
+ CrashReportExceptionHandler::~CrashReportExceptionHandler() {}
+ 
+@@ -101,7 +104,7 @@ unsigned int CrashReportExceptionHandler::ExceptionHandlerServerException(
+     process_snapshot.SetReportID(new_report->ReportID());
+ 
+     MinidumpFileWriter minidump;
+-    minidump.InitializeFromSnapshot(&process_snapshot);
++    minidump.InitializeFromSnapshot(&process_snapshot, allowed_annotations_);
+     AddUserExtensionStreams(
+         user_stream_data_sources_, &process_snapshot, &minidump);
+ 
+diff --git a/handler/win/crash_report_exception_handler.h b/handler/win/crash_report_exception_handler.h
+index 7e354d34..cbe15443 100644
+--- a/handler/win/crash_report_exception_handler.h
++++ b/handler/win/crash_report_exception_handler.h
+@@ -18,6 +18,7 @@
+ #include <windows.h>
+ 
+ #include <map>
++#include <set>
+ #include <string>
+ 
+ #include "handler/user_stream_data_source.h"
+@@ -60,7 +61,8 @@ class CrashReportExceptionHandler final
+       CrashReportUploadThread* upload_thread,
+       const std::map<std::string, std::string>* process_annotations,
+       const std::vector<base::FilePath>* attachments,
+-      const UserStreamDataSources* user_stream_data_sources);
++      const UserStreamDataSources* user_stream_data_sources,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   CrashReportExceptionHandler(const CrashReportExceptionHandler&) = delete;
+   CrashReportExceptionHandler& operator=(const CrashReportExceptionHandler&) =
+@@ -84,6 +86,7 @@ class CrashReportExceptionHandler final
+   const std::map<std::string, std::string>* process_annotations_;  // weak
+   const std::vector<base::FilePath>* attachments_;  // weak
+   const UserStreamDataSources* user_stream_data_sources_;  // weak
++  const std::set<std::string>* allowed_annotations_;  // weak
+ };
+ 
+ }  // namespace crashpad
+diff --git a/minidump/minidump_crashpad_info_writer.cc b/minidump/minidump_crashpad_info_writer.cc
+index 76206a81..6ceb6518 100644
+--- a/minidump/minidump_crashpad_info_writer.cc
++++ b/minidump/minidump_crashpad_info_writer.cc
+@@ -38,7 +38,8 @@ MinidumpCrashpadInfoWriter::~MinidumpCrashpadInfoWriter() {
+ }
+ 
+ void MinidumpCrashpadInfoWriter::InitializeFromSnapshot(
+-    const ProcessSnapshot* process_snapshot) {
++    const ProcessSnapshot* process_snapshot,
++    const std::set<std::string>* allowed_annotations) {
+   DCHECK_EQ(state(), kStateMutable);
+   DCHECK(!module_list_);
+ 
+@@ -50,10 +51,17 @@ void MinidumpCrashpadInfoWriter::InitializeFromSnapshot(
+   process_snapshot->ClientID(&client_id);
+   SetClientID(client_id);
+ 
++  auto simple_map = process_snapshot->AnnotationsSimpleMap();
++  if (allowed_annotations) {
++    for (auto it = simple_map.begin(); it != simple_map.end(); ) {
++      it = (allowed_annotations->count(it->first) == 0)
++               ? simple_map.erase(it)
++               : std::next(it);
++    }
++  }
+   auto simple_annotations =
+       std::make_unique<MinidumpSimpleStringDictionaryWriter>();
+-  simple_annotations->InitializeFromMap(
+-      process_snapshot->AnnotationsSimpleMap());
++  simple_annotations->InitializeFromMap(simple_map);
+   if (simple_annotations->IsUseful()) {
+     SetSimpleAnnotations(std::move(simple_annotations));
+   }
+@@ -63,7 +71,8 @@ void MinidumpCrashpadInfoWriter::InitializeFromSnapshot(
+   }
+ 
+   auto modules = std::make_unique<MinidumpModuleCrashpadInfoListWriter>();
+-  modules->InitializeFromSnapshot(process_snapshot->Modules());
++  modules->InitializeFromSnapshot(process_snapshot->Modules(),
++                                  allowed_annotations);
+ 
+   if (modules->IsUseful()) {
+     SetModuleList(std::move(modules));
+diff --git a/minidump/minidump_crashpad_info_writer.h b/minidump/minidump_crashpad_info_writer.h
+index 02907cc8..b8ac46b8 100644
+--- a/minidump/minidump_crashpad_info_writer.h
++++ b/minidump/minidump_crashpad_info_writer.h
+@@ -18,6 +18,8 @@
+ #include <sys/types.h>
+ 
+ #include <memory>
++#include <set>
++#include <string>
+ #include <vector>
+ 
+ #include "minidump/minidump_extensions.h"
+@@ -56,7 +58,9 @@ class MinidumpCrashpadInfoWriter final : public internal::MinidumpStreamWriter {
+   //! \note Valid in #kStateMutable. No mutator methods may be called before
+   //!     this method, and it is not normally necessary to call any mutator
+   //!     methods after this method.
+-  void InitializeFromSnapshot(const ProcessSnapshot* process_snapshot);
++  void InitializeFromSnapshot(
++      const ProcessSnapshot* process_snapshot,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   //! \brief Sets MinidumpCrashpadInfo::report_id.
+   void SetReportID(const UUID& report_id);
+diff --git a/minidump/minidump_crashpad_info_writer_test.cc b/minidump/minidump_crashpad_info_writer_test.cc
+index d01655d8..83ba706f 100644
+--- a/minidump/minidump_crashpad_info_writer_test.cc
++++ b/minidump/minidump_crashpad_info_writer_test.cc
+@@ -383,6 +383,96 @@ TEST(MinidumpCrashpadInfoWriter, InitializeFromSnapshot) {
+   EXPECT_FALSE(module_simple_annotations);
+ }
+ 
++// Tests for the annotation allowlist (crashkit patch).
++// These run fully in-memory via StringFile — no device required.
++
++TEST(MinidumpCrashpadInfoWriter, AllowlistFiltersModuleAnnotations) {
++  // Process snapshot has one module with two annotations: "crash_key" (allowed)
++  // and "guid" (blocked). The allowlist must strip "guid" from the minidump.
++  static constexpr char kAllowedKey[] = "crash_key";
++  static constexpr char kAllowedValue[] = "OOM";
++  static constexpr char kPiiKey[] = "guid";
++  static constexpr char kPiiValue[] = "some-uuid";
++
++  auto process_snapshot = std::make_unique<TestProcessSnapshot>();
++
++  auto module_snapshot = std::make_unique<TestModuleSnapshot>();
++  std::map<std::string, std::string> simple_map;
++  simple_map[kAllowedKey] = kAllowedValue;
++  simple_map[kPiiKey] = kPiiValue;
++  module_snapshot->SetAnnotationsSimpleMap(simple_map);
++  process_snapshot->AddModule(std::move(module_snapshot));
++
++  const std::set<std::string> allowed_annotations = {kAllowedKey};
++
++  auto info_writer = std::make_unique<MinidumpCrashpadInfoWriter>();
++  info_writer->InitializeFromSnapshot(process_snapshot.get(),
++                                      &allowed_annotations);
++  EXPECT_TRUE(info_writer->IsUseful());
++
++  MinidumpFileWriter minidump_file_writer;
++  ASSERT_TRUE(minidump_file_writer.AddStream(std::move(info_writer)));
++
++  StringFile string_file;
++  ASSERT_TRUE(minidump_file_writer.WriteEverything(&string_file));
++
++  const MinidumpCrashpadInfo* info = nullptr;
++  const MinidumpSimpleStringDictionary* process_simple_annotations = nullptr;
++  const MinidumpModuleCrashpadInfoList* module_list = nullptr;
++  ASSERT_NO_FATAL_FAILURE(GetCrashpadInfoStream(
++      string_file.string(), &info, &process_simple_annotations, &module_list));
++
++  // The module list must be present with one entry.
++  ASSERT_TRUE(module_list);
++  ASSERT_EQ(module_list->count, 1u);
++
++  const MinidumpModuleCrashpadInfo* module =
++      MinidumpWritableAtLocationDescriptor<MinidumpModuleCrashpadInfo>(
++          string_file.string(), module_list->modules[0].location);
++  ASSERT_TRUE(module);
++
++  const MinidumpSimpleStringDictionary* written_module_annotations =
++      MinidumpWritableAtLocationDescriptor<MinidumpSimpleStringDictionary>(
++          string_file.string(), module->simple_annotations);
++  ASSERT_TRUE(written_module_annotations);
++
++  // Only "crash_key" must survive.
++  ASSERT_EQ(written_module_annotations->count, 1u);
++  EXPECT_EQ(MinidumpUTF8StringAtRVAAsString(
++                string_file.string(),
++                written_module_annotations->entries[0].key),
++            kAllowedKey);
++  EXPECT_EQ(MinidumpUTF8StringAtRVAAsString(
++                string_file.string(),
++                written_module_annotations->entries[0].value),
++            kAllowedValue);
++}
++
++TEST(MinidumpCrashpadInfoWriter, AllowlistEmptyFiltersAllModuleAnnotations) {
++  // With an empty allowlist every annotation is stripped; the module becomes
++  // useless and must not appear in the minidump at all.
++  auto process_snapshot = std::make_unique<TestProcessSnapshot>();
++
++  auto module_snapshot = std::make_unique<TestModuleSnapshot>();
++  std::map<std::string, std::string> simple_map;
++  simple_map["guid"] = "some-uuid";
++  simple_map["variations"] = "abc123";
++  module_snapshot->SetAnnotationsSimpleMap(simple_map);
++  module_snapshot->SetAnnotationObjects(
++      {AnnotationSnapshot("gpu-generation", 1, {'0'})});
++  process_snapshot->AddModule(std::move(module_snapshot));
++
++  const std::set<std::string> allowed_annotations;  // empty
++
++  auto info_writer = std::make_unique<MinidumpCrashpadInfoWriter>();
++  info_writer->InitializeFromSnapshot(process_snapshot.get(),
++                                      &allowed_annotations);
++
++  // No module carries useful data — IsUseful() should be false (nothing to
++  // write into the crashpad info stream beyond the bare struct).
++  EXPECT_FALSE(info_writer->IsUseful());
++}
++
+ }  // namespace
+ }  // namespace test
+ }  // namespace crashpad
+diff --git a/minidump/minidump_file_writer.cc b/minidump/minidump_file_writer.cc
+index 35d226bb..5cdaf536 100644
+--- a/minidump/minidump_file_writer.cc
++++ b/minidump/minidump_file_writer.cc
+@@ -59,7 +59,8 @@ MinidumpFileWriter::~MinidumpFileWriter() {
+ }
+ 
+ void MinidumpFileWriter::InitializeFromSnapshot(
+-    const ProcessSnapshot* process_snapshot) {
++    const ProcessSnapshot* process_snapshot,
++    const std::set<std::string>* allowed_annotations) {
+   DCHECK_EQ(state(), kStateMutable);
+   DCHECK_EQ(header_.Signature, 0u);
+   DCHECK_EQ(header_.TimeDateStamp, 0u);
+@@ -145,7 +146,7 @@ void MinidumpFileWriter::InitializeFromSnapshot(
+   }
+ 
+   auto crashpad_info = std::make_unique<MinidumpCrashpadInfoWriter>();
+-  crashpad_info->InitializeFromSnapshot(process_snapshot);
++  crashpad_info->InitializeFromSnapshot(process_snapshot, allowed_annotations);
+ 
+   // Since the MinidumpCrashpadInfo stream is an extension, it’s safe to not add
+   // it to the minidump file if it wouldn’t carry any useful information.
+diff --git a/minidump/minidump_file_writer.h b/minidump/minidump_file_writer.h
+index e983cc09..1525cb3c 100644
+--- a/minidump/minidump_file_writer.h
++++ b/minidump/minidump_file_writer.h
+@@ -76,7 +76,9 @@ class MinidumpFileWriter final : public internal::MinidumpWritable {
+   //! \note Valid in #kStateMutable. No mutator methods may be called before
+   //!     this method, and it is not normally necessary to call any mutator
+   //!     methods after this method.
+-  void InitializeFromSnapshot(const ProcessSnapshot* process_snapshot);
++  void InitializeFromSnapshot(
++      const ProcessSnapshot* process_snapshot,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   //! \brief Sets MINIDUMP_HEADER::Timestamp.
+   //!
+diff --git a/minidump/minidump_module_crashpad_info_writer.cc b/minidump/minidump_module_crashpad_info_writer.cc
+index 7f3dcda9..a237ffaf 100644
+--- a/minidump/minidump_module_crashpad_info_writer.cc
++++ b/minidump/minidump_module_crashpad_info_writer.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "minidump/minidump_module_crashpad_info_writer.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ #include "base/check_op.h"
+@@ -39,7 +40,8 @@ MinidumpModuleCrashpadInfoWriter::~MinidumpModuleCrashpadInfoWriter() {
+ }
+ 
+ void MinidumpModuleCrashpadInfoWriter::InitializeFromSnapshot(
+-    const ModuleSnapshot* module_snapshot) {
++    const ModuleSnapshot* module_snapshot,
++    const std::set<std::string>* allowed_annotations) {
+   DCHECK_EQ(state(), kStateMutable);
+   DCHECK(!list_annotations_);
+   DCHECK(!simple_annotations_);
+@@ -50,16 +52,32 @@ void MinidumpModuleCrashpadInfoWriter::InitializeFromSnapshot(
+     SetListAnnotations(std::move(list_annotations));
+   }
+ 
++  auto simple_map = module_snapshot->AnnotationsSimpleMap();
++  if (allowed_annotations) {
++    for (auto it = simple_map.begin(); it != simple_map.end(); ) {
++      it = (allowed_annotations->count(it->first) == 0)
++               ? simple_map.erase(it)
++               : std::next(it);
++    }
++  }
+   auto simple_annotations =
+       std::make_unique<MinidumpSimpleStringDictionaryWriter>();
+-  simple_annotations->InitializeFromMap(
+-      module_snapshot->AnnotationsSimpleMap());
++  simple_annotations->InitializeFromMap(simple_map);
+   if (simple_annotations->IsUseful()) {
+     SetSimpleAnnotations(std::move(simple_annotations));
+   }
+ 
++  auto annotation_list = module_snapshot->AnnotationObjects();
++  if (allowed_annotations) {
++    annotation_list.erase(
++        std::remove_if(annotation_list.begin(), annotation_list.end(),
++                       [&](const AnnotationSnapshot& a) {
++                         return allowed_annotations->count(a.name) == 0;
++                       }),
++        annotation_list.end());
++  }
+   auto annotation_objects = std::make_unique<MinidumpAnnotationListWriter>();
+-  annotation_objects->InitializeFromList(module_snapshot->AnnotationObjects());
++  annotation_objects->InitializeFromList(annotation_list);
+   if (annotation_objects->IsUseful()) {
+     SetAnnotationObjects(std::move(annotation_objects));
+   }
+@@ -156,7 +174,8 @@ MinidumpModuleCrashpadInfoListWriter::~MinidumpModuleCrashpadInfoListWriter() {
+ }
+ 
+ void MinidumpModuleCrashpadInfoListWriter::InitializeFromSnapshot(
+-    const std::vector<const ModuleSnapshot*>& module_snapshots) {
++    const std::vector<const ModuleSnapshot*>& module_snapshots,
++    const std::set<std::string>* allowed_annotations) {
+   DCHECK_EQ(state(), kStateMutable);
+   DCHECK(module_crashpad_infos_.empty());
+   DCHECK(module_crashpad_info_links_.empty());
+@@ -166,7 +185,7 @@ void MinidumpModuleCrashpadInfoListWriter::InitializeFromSnapshot(
+     const ModuleSnapshot* module_snapshot = module_snapshots[index];
+ 
+     auto module = std::make_unique<MinidumpModuleCrashpadInfoWriter>();
+-    module->InitializeFromSnapshot(module_snapshot);
++    module->InitializeFromSnapshot(module_snapshot, allowed_annotations);
+     if (module->IsUseful()) {
+       AddModule(std::move(module), index);
+     }
+diff --git a/minidump/minidump_module_crashpad_info_writer.h b/minidump/minidump_module_crashpad_info_writer.h
+index ec3f7e41..0ed33084 100644
+--- a/minidump/minidump_module_crashpad_info_writer.h
++++ b/minidump/minidump_module_crashpad_info_writer.h
+@@ -19,6 +19,8 @@
+ #include <sys/types.h>
+ 
+ #include <memory>
++#include <set>
++#include <string>
+ #include <vector>
+ 
+ #include "minidump/minidump_extensions.h"
+@@ -56,7 +58,9 @@ class MinidumpModuleCrashpadInfoWriter final
+   //! \note Valid in #kStateMutable. No mutator methods may be called before
+   //!     this method, and it is not normally necessary to call any mutator
+   //!     methods after this method.
+-  void InitializeFromSnapshot(const ModuleSnapshot* module_snapshot);
++  void InitializeFromSnapshot(
++      const ModuleSnapshot* module_snapshot,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   //! \brief Arranges for MinidumpModuleCrashpadInfo::list_annotations to point
+   //!     to the internal::MinidumpUTF8StringListWriter object to be written by
+@@ -141,7 +145,8 @@ class MinidumpModuleCrashpadInfoListWriter final
+   //!     method, and it is not normally necessary to call AddModule() after
+   //!     this method.
+   void InitializeFromSnapshot(
+-      const std::vector<const ModuleSnapshot*>& module_snapshots);
++      const std::vector<const ModuleSnapshot*>& module_snapshots,
++      const std::set<std::string>* allowed_annotations = nullptr);
+ 
+   //! \brief Adds a MinidumpModuleCrashpadInfo to the
+   //!     MinidumpModuleCrashpadInfoList.
+diff --git a/minidump/minidump_module_crashpad_info_writer_test.cc b/minidump/minidump_module_crashpad_info_writer_test.cc
+index 88af7fee..fddae22a 100644
+--- a/minidump/minidump_module_crashpad_info_writer_test.cc
++++ b/minidump/minidump_module_crashpad_info_writer_test.cc
+@@ -602,6 +602,167 @@ TEST(MinidumpModuleCrashpadInfoWriter, InitializeFromSnapshot) {
+             annotation.value);
+ }
+ 
++// Tests for the annotation allowlist (crashkit patch).
++// These run fully in-memory via StringFile — no device required.
++
++TEST(MinidumpModuleCrashpadInfoWriter, AllowlistFiltersSimpleAnnotations) {
++  // Module has two simple-map annotations: "allowed_key" and "pii_key".
++  // The allowlist only permits "allowed_key"; "pii_key" must be absent.
++  static constexpr char kAllowedKey[] = "allowed_key";
++  static constexpr char kAllowedValue[] = "safe_value";
++  static constexpr char kPiiKey[] = "pii_key";
++  static constexpr char kPiiValue[] = "secret";
++
++  TestModuleSnapshot module_snapshot;
++  std::map<std::string, std::string> simple_map;
++  simple_map[kAllowedKey] = kAllowedValue;
++  simple_map[kPiiKey] = kPiiValue;
++  module_snapshot.SetAnnotationsSimpleMap(simple_map);
++
++  const std::set<std::string> allowed_annotations = {kAllowedKey};
++
++  auto module_list_writer =
++      std::make_unique<MinidumpModuleCrashpadInfoListWriter>();
++  std::vector<const ModuleSnapshot*> snapshots = {&module_snapshot};
++  module_list_writer->InitializeFromSnapshot(snapshots, &allowed_annotations);
++  EXPECT_TRUE(module_list_writer->IsUseful());
++
++  StringFile string_file;
++  ASSERT_TRUE(module_list_writer->WriteEverything(&string_file));
++
++  const MinidumpModuleCrashpadInfoList* module_list =
++      MinidumpModuleCrashpadInfoListAtStart(string_file.string(), 1);
++  ASSERT_TRUE(module_list);
++
++  const MinidumpModuleCrashpadInfo* module =
++      MinidumpWritableAtLocationDescriptor<MinidumpModuleCrashpadInfo>(
++          string_file.string(), module_list->modules[0].location);
++  ASSERT_TRUE(module);
++
++  const MinidumpSimpleStringDictionary* written_annotations =
++      MinidumpWritableAtLocationDescriptor<MinidumpSimpleStringDictionary>(
++          string_file.string(), module->simple_annotations);
++  ASSERT_TRUE(written_annotations);
++
++  // Exactly one annotation must survive: the allowed one.
++  ASSERT_EQ(written_annotations->count, 1u);
++  EXPECT_EQ(MinidumpUTF8StringAtRVAAsString(string_file.string(),
++                                            written_annotations->entries[0].key),
++            kAllowedKey);
++  EXPECT_EQ(MinidumpUTF8StringAtRVAAsString(
++                string_file.string(), written_annotations->entries[0].value),
++            kAllowedValue);
++}
++
++TEST(MinidumpModuleCrashpadInfoWriter, AllowlistFiltersAnnotationObjects) {
++  // Module has two annotation objects: "allowed_annotation" and "guid".
++  // The allowlist only permits "allowed_annotation"; "guid" must be absent.
++  const AnnotationSnapshot allowed_ann(
++      "allowed_annotation", 1, {'o', 'k'});
++  const AnnotationSnapshot pii_ann(
++      "guid", 1, {'d', 'e', 'a', 'd', 'b', 'e', 'e', 'f'});
++
++  TestModuleSnapshot module_snapshot;
++  module_snapshot.SetAnnotationObjects({allowed_ann, pii_ann});
++
++  const std::set<std::string> allowed_annotations = {"allowed_annotation"};
++
++  auto module_list_writer =
++      std::make_unique<MinidumpModuleCrashpadInfoListWriter>();
++  std::vector<const ModuleSnapshot*> snapshots = {&module_snapshot};
++  module_list_writer->InitializeFromSnapshot(snapshots, &allowed_annotations);
++  EXPECT_TRUE(module_list_writer->IsUseful());
++
++  StringFile string_file;
++  ASSERT_TRUE(module_list_writer->WriteEverything(&string_file));
++
++  const MinidumpModuleCrashpadInfoList* module_list =
++      MinidumpModuleCrashpadInfoListAtStart(string_file.string(), 1);
++  ASSERT_TRUE(module_list);
++
++  const MinidumpModuleCrashpadInfo* module =
++      MinidumpWritableAtLocationDescriptor<MinidumpModuleCrashpadInfo>(
++          string_file.string(), module_list->modules[0].location);
++  ASSERT_TRUE(module);
++
++  const MinidumpAnnotationList* written_objects =
++      MinidumpWritableAtLocationDescriptor<MinidumpAnnotationList>(
++          string_file.string(), module->annotation_objects);
++  ASSERT_TRUE(written_objects);
++
++  // Exactly one object must survive: the allowed one.
++  ASSERT_EQ(written_objects->count, 1u);
++  EXPECT_EQ(
++      MinidumpUTF8StringAtRVAAsString(string_file.string(),
++                                      written_objects->objects[0].name),
++      allowed_ann.name);
++}
++
++TEST(MinidumpModuleCrashpadInfoWriter, AllowlistEmptyDropsModule) {
++  // When the allowlist is non-null but empty, every annotation is filtered out
++  // and the module produces no useful data (not written at all).
++  TestModuleSnapshot module_snapshot;
++  std::map<std::string, std::string> simple_map;
++  simple_map["some_key"] = "some_value";
++  module_snapshot.SetAnnotationsSimpleMap(simple_map);
++  module_snapshot.SetAnnotationObjects(
++      {AnnotationSnapshot("guid", 1, {'x'})});
++
++  const std::set<std::string> allowed_annotations;  // empty
++
++  auto module_list_writer =
++      std::make_unique<MinidumpModuleCrashpadInfoListWriter>();
++  std::vector<const ModuleSnapshot*> snapshots = {&module_snapshot};
++  module_list_writer->InitializeFromSnapshot(snapshots, &allowed_annotations);
++
++  // No module carries useful data after filtering.
++  EXPECT_FALSE(module_list_writer->IsUseful());
++}
++
++TEST(MinidumpModuleCrashpadInfoWriter, NullAllowlistPassesAllAnnotations) {
++  // When allowed_annotations is nullptr (no filter), all annotations pass.
++  static constexpr char kKey[] = "guid";
++  static constexpr char kValue[] = "some-uuid-value";
++  const AnnotationSnapshot ann("variations", 1, {'v'});
++
++  TestModuleSnapshot module_snapshot;
++  std::map<std::string, std::string> simple_map;
++  simple_map[kKey] = kValue;
++  module_snapshot.SetAnnotationsSimpleMap(simple_map);
++  module_snapshot.SetAnnotationObjects({ann});
++
++  auto module_list_writer =
++      std::make_unique<MinidumpModuleCrashpadInfoListWriter>();
++  std::vector<const ModuleSnapshot*> snapshots = {&module_snapshot};
++  module_list_writer->InitializeFromSnapshot(snapshots, nullptr);
++  EXPECT_TRUE(module_list_writer->IsUseful());
++
++  StringFile string_file;
++  ASSERT_TRUE(module_list_writer->WriteEverything(&string_file));
++
++  const MinidumpModuleCrashpadInfoList* module_list =
++      MinidumpModuleCrashpadInfoListAtStart(string_file.string(), 1);
++  ASSERT_TRUE(module_list);
++
++  const MinidumpModuleCrashpadInfo* module =
++      MinidumpWritableAtLocationDescriptor<MinidumpModuleCrashpadInfo>(
++          string_file.string(), module_list->modules[0].location);
++  ASSERT_TRUE(module);
++
++  // Both annotation types must be present when no filter is applied.
++  const MinidumpSimpleStringDictionary* written_simple =
++      MinidumpWritableAtLocationDescriptor<MinidumpSimpleStringDictionary>(
++          string_file.string(), module->simple_annotations);
++  ASSERT_TRUE(written_simple);
++  EXPECT_EQ(written_simple->count, 1u);
++
++  const MinidumpAnnotationList* written_objects =
++      MinidumpWritableAtLocationDescriptor<MinidumpAnnotationList>(
++          string_file.string(), module->annotation_objects);
++  ASSERT_TRUE(written_objects);
++  EXPECT_EQ(written_objects->count, 1u);
++}
++
+ }  // namespace
+ }  // namespace test
+ }  // namespace crashpad

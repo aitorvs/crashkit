@@ -16,6 +16,7 @@
 #define CRASHPAD_HANDLER_LINUX_CRASH_REPORT_EXCEPTION_HANDLER_H_
 
 #include <map>
+#include <set>
 #include <string>
 
 #include "client/crash_report_database.h"
@@ -69,7 +70,8 @@ class CrashReportExceptionHandler : public ExceptionHandlerServer::Delegate {
       const std::vector<base::FilePath>* attachments,
       bool write_minidump_to_database,
       bool write_minidump_to_log,
-      const UserStreamDataSources* user_stream_data_sources);
+      const UserStreamDataSources* user_stream_data_sources,
+      const std::set<std::string>* allowed_annotations = nullptr);
 
   CrashReportExceptionHandler(const CrashReportExceptionHandler&) = delete;
   CrashReportExceptionHandler& operator=(const CrashReportExceptionHandler&) =
@@ -116,6 +118,7 @@ class CrashReportExceptionHandler : public ExceptionHandlerServer::Delegate {
   bool write_minidump_to_database_;
   bool write_minidump_to_log_;
   const UserStreamDataSources* user_stream_data_sources_;  // weak
+  const std::set<std::string>* allowed_annotations_;  // weak
 };
 
 }  // namespace crashpad

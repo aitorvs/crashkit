@@ -185,6 +185,17 @@ fi
 header "Step 1.5 — Apply patches"
 "$SCRIPT_DIR/apply_patches.zsh" --crashpad-dir "$CRASHPAD_DIR"
 
+# ── Step 1.6: Verify patches via host tests ──────────────────────────────────
+header "Step 1.6 — Verify patches (host tests)"
+if command -v gn &>/dev/null && command -v ninja &>/dev/null; then
+  "$SCRIPT_DIR/run_minidump_tests.zsh" --out "${CRASHPAD_DIR}/out/host"
+  success "Patch verification passed."
+else
+  warn "gn/ninja not found on PATH — skipping host test verification."
+  warn "Install with: brew install gn ninja  (or add depot_tools to PATH)"
+  warn "Then run manually: scripts/run_minidump_tests.zsh"
+fi
+
 # ── Step 2: Build ─────────────────────────────────────────────────────────────
 header "Step 2 — Build Crashpad"
 # Export NDK so crashpad_build.zsh (called by crashpad_all.zsh) can find it

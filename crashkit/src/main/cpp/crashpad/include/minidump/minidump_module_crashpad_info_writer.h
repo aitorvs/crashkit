@@ -19,6 +19,8 @@
 #include <sys/types.h>
 
 #include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "minidump/minidump_extensions.h"
@@ -56,7 +58,9 @@ class MinidumpModuleCrashpadInfoWriter final
   //! \note Valid in #kStateMutable. No mutator methods may be called before
   //!     this method, and it is not normally necessary to call any mutator
   //!     methods after this method.
-  void InitializeFromSnapshot(const ModuleSnapshot* module_snapshot);
+  void InitializeFromSnapshot(
+      const ModuleSnapshot* module_snapshot,
+      const std::set<std::string>* allowed_annotations = nullptr);
 
   //! \brief Arranges for MinidumpModuleCrashpadInfo::list_annotations to point
   //!     to the internal::MinidumpUTF8StringListWriter object to be written by
@@ -141,7 +145,8 @@ class MinidumpModuleCrashpadInfoListWriter final
   //!     method, and it is not normally necessary to call AddModule() after
   //!     this method.
   void InitializeFromSnapshot(
-      const std::vector<const ModuleSnapshot*>& module_snapshots);
+      const std::vector<const ModuleSnapshot*>& module_snapshots,
+      const std::set<std::string>* allowed_annotations = nullptr);
 
   //! \brief Adds a MinidumpModuleCrashpadInfo to the
   //!     MinidumpModuleCrashpadInfoList.

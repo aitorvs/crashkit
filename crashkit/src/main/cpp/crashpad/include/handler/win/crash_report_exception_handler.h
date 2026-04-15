@@ -18,6 +18,7 @@
 #include <windows.h>
 
 #include <map>
+#include <set>
 #include <string>
 
 #include "handler/user_stream_data_source.h"
@@ -60,7 +61,8 @@ class CrashReportExceptionHandler final
       CrashReportUploadThread* upload_thread,
       const std::map<std::string, std::string>* process_annotations,
       const std::vector<base::FilePath>* attachments,
-      const UserStreamDataSources* user_stream_data_sources);
+      const UserStreamDataSources* user_stream_data_sources,
+      const std::set<std::string>* allowed_annotations = nullptr);
 
   CrashReportExceptionHandler(const CrashReportExceptionHandler&) = delete;
   CrashReportExceptionHandler& operator=(const CrashReportExceptionHandler&) =
@@ -84,6 +86,7 @@ class CrashReportExceptionHandler final
   const std::map<std::string, std::string>* process_annotations_;  // weak
   const std::vector<base::FilePath>* attachments_;  // weak
   const UserStreamDataSources* user_stream_data_sources_;  // weak
+  const std::set<std::string>* allowed_annotations_;  // weak
 };
 
 }  // namespace crashpad
