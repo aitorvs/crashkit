@@ -97,13 +97,38 @@ dependencies {
 
 ## Publishing
 
+### Prerequisites
+
+Add the following to `~/.gradle/gradle.properties` (not in this repo):
+
+```properties
+# Sonatype Central Portal credentials
+# Generate at: https://central.sonatype.com/account → User Tokens
+mavenCentralUsername=<token-username>
+mavenCentralPassword=<token-password>
+
+# GPG signing key
+signing.keyId=<last-8-chars-of-key-id>
+signing.password=<passphrase>
+signing.secretKeyRingFile=/Users/you/.gnupg/secring.gpg
+```
+
+To export your secret keyring if it doesn't exist yet:
 ```bash
-# Publish to Maven local
+gpg --export-secret-keys > ~/.gnupg/secring.gpg
+```
+
+### Commands
+
+```bash
+# Publish to Maven local (no credentials needed)
 ./gradlew :crashkit:publishToMavenLocal -PVERSION_NAME=0.0.2-SNAPSHOT
 
-# Publish to Maven Central (requires signing config)
-./gradlew :crashkit:publishToMavenCentral -PVERSION_NAME=1.0.0
+# Publish to Maven Central and release (upload + close + release staging repo)
+./gradlew :crashkit:publishAndReleaseToMavenCentral -PVERSION_NAME=1.0.0
 ```
+
+`VERSION_NAME` can also be set permanently in `gradle.properties` instead of passing it on the command line.
 
 ---
 
