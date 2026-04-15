@@ -1,9 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.library")
     id("com.vanniktech.maven.publish") version "0.34.0"
     kotlin("android")
 }
-val libVersion = providers.gradleProperty("VERSION_NAME").orElse("0.0.1-SNAPSHOT").get()
+val libVersion: String by lazy {
+    val props = Properties()
+    rootProject.file("version.properties").inputStream().use { props.load(it) }
+    props.getProperty("VERSION_NAME") ?: error("VERSION_NAME not found in version.properties")
+}
 
 mavenPublishing {
     publishToMavenCentral()
